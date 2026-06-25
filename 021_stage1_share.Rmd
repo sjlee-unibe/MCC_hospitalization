@@ -1,0 +1,469 @@
+---
+title: "02_stage1"
+author: "Sujung Lee"
+date: "2026-04-25"
+output: html_document
+---
+
+# MCC STUDY — STAGE 1 (location-specific) ANALYSIS
+Run this script LOCALLY on your hospitalisation data and return the RESULTS files (model coefficients + variances).
+
+## How to use
+1. Edit ONLY the CONFIGURATION block below:
+ - file paths and output folder
+ - your COUNTRY code
+ - the CSV column separator
+ - AGE_MAP  (map YOUR age-group labels to the harmonised codes)
+2. Run the whole script:
+3. Send back the four files written to `dir_out` (see OUTPUT below).
+
+## REQUIRED HEALTH DATA FORMAT
+- A column named exactly  date  (YYYY-MM-DD), one row per day.
+- Every OTHER column is a daily hospitalisation count, named: <sex>_<age>_<cause>_<location>
+where:
+  <sex> = fem | mal (exactly these codes)
+  <age> = 0to1 | 2to18 | 19to45 | 46to65 | 66to75 | 76to85 | more86 (or similar format)
+  <cause> = one of CAUSES below
+  <location> = city/area name (may contain spaces or "-")
+  NOTE: sex, age and cause must NOT contain underscores; only <location> may.
+    Examples:
+        fem_19to45_cvd_mexico city
+        mal_more86_resp_guadalajara
+
+## Required output (<CC> is country code; United Kingdom = UK)
+  <CC>_stage1_allsex_t2m.csv   all-sex, by cause
+  <CC>_stage1_fem_t2m.csv       females, by cause
+  <CC>_stage1_mal_t2m.csv       males, by cause
+  <CC>_stage1_age_t2m.csv       age-specific (all-sex), by cause
+
+
+#### Load libraries
+```{r, echo = FALSE}
+required <- c("dplyr", "tidyr", "lubridate", "stringr", "splines", "dlnm", "MESS")
+missing  <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) {
+  stop("Missing packages. Please run:\n  install.packages(c(",
+       paste(sprintf('"%s"', missing), collapse = ", "), "))")
+}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(lubridate)
+  library(stringr); library(splines); library(dlnm); library(MESS)
+})
+```
+
+#### DLNM specification
+```{r}
+# Specification of the lag function
+maxlag <- 21
+lagfun <- "ns"
+lagnk <- 3
+lagknots <- logknots(maxlag, lagnk)
+
+# Specification of the exposure function
+varfun <- "ns" 
+varper <- c(50)
+
+predper <- c(seq(0, 1, 0.1), 2:98, seq(99, 100, 0.1))
+axisper <- c(1, 25, 50, 75, 90)
+mhprange <- c(25, 90)
+minhosp <- 500
+
+agebreaks <- c(20, 45, 65, 75, 85)
+ageknots <- c(60)
+
+causes <- c("all", "cvd", "resp", "inf", "ment", "uri")
+```
+
+## 1. Load data
+```{r}
+dir_data <- "path/to/your/file/directory/"
+
+# Load climate data
+dat_clim <- readRDS(paste0(dir_data, "MX_daily_list_t2m.rds"))
+
+# Load health data
+dat_health <- read.csv(paste0(dir_data, "mx_mcc_timeseries.csv"), sep = ";")
+head(dat_health)
+```
+
+## Reformat health data to run 1st-stage analysis
+Assumes the health data follow the MCC data protocol exactly:
+  - one column named 'date' (YYYY-MM-DD)
+  - every other column named  <sex>_<age>_<cause>_<location>
+The age harmonisation below is FIXED by the protocol 
+  — if you have different age groups, please contact Sujung Lee.
+```{r}
+dat_health_long <- dat_health %>%
+  pivot_longer(
+    cols = -date,
+    names_to  = c("sex", "age", "cause", "location"),
+    names_pattern = "^([^_]+)_([^_]+)_([^_]+)_(.+)$",
+    values_to = "hosp"
+  ) %>%
+  mutate(age_regroup = case_when(
+    age == "0to1" ~ "0018",
+    age == "2to18" ~ "0018",
+    age == "19to45" ~ "1945",
+    age == "46to65" ~ "4675",
+    age == "66to75" ~ "4675",
+    age == "76to85" ~ "76up",
+    age == "more86" ~ "76up",
+    .default = age
+  )) %>%
+  mutate(
+    date = as.Date(date),
+        year = as.integer(format(date, "%Y")),
+        month = as.integer(format(date, "%m")),
+        dow = weekdays(date)
+  ) %>%
+  group_by(location, date, year, month, dow,
+           sex, age_regroup, cause) %>%
+  summarise(hosp = sum(hosp, na.rm=T), .groups = "drop") %>%
+  mutate(col_name = paste0(sex, "_", age_regroup, "_", cause)) %>%
+  dplyr::select(-sex, -age_regroup, -cause) %>%
+  pivot_wider(
+    names_from = col_name,
+    values_from = hosp
+  )
+
+# Make sure names of location in health data and climate data are same
+dat_health_long$location <- tolower(str_replace_all(dat_health_long$location, "[ -]", "_"))
+dat_health_list <- dat_health_long %>% split(.$location)
+rm(dat_health_long)
+```
+
+## Merge health and climate data
+```{r}
+dlist <- list()
+for (i in seq_along(names(dat_health_list))) {
+      
+  # Extract city name
+  city_name <- names(dat_health_list)[i]
+  
+  # Extract climate and health data for selected city
+  dat_health_city <- dat_health_list[[city_name]]
+  start_date <- as.Date(min(dat_health_city$date))
+  end_date <- as.Date(max(dat_health_city$date))
+  dat_clim_city <- dat_clim[[city_name]] %>%
+    mutate(date = as.Date(date)) %>%
+    filter(date >= start_date & date <= end_date)
+  
+  # Merge health and climate data
+  dat_city <- left_join(dat_clim_city, dat_health_city, by = c("location", "date"))
+  dat_city <- dat_city %>%
+    mutate(across(7:ncol(.), ~replace_na(.x, 0)))
+  
+  dlist[[city_name]] <- dat_city
+}
+
+# Check NA
+na_check <- lapply(dlist, function(df) {
+  na_counts <- colSums(is.na(df))
+  na_counts[na_counts > 0]
+})
+
+print(na_check)
+
+rm(dat_health_list, dat_clim)
+```
+
+## All-age analysis
+#### 1st stage: Fit location-cause models by aggregating all age groups
+```{r}
+stage1_all <- list()
+
+for (cx in causes) {
+    
+  # Create empty list to store results for selected cause
+  stage1_all[[cx]] <- list()
+    
+  for (i in seq_along(names(dlist))) {
+      
+    # Extract city name
+    city_name <- names(dlist)[i]
+    
+    # Extract main data for selected months
+    city_df <- dlist[[city_name]] %>%
+      mutate(
+        date = as.Date(date),
+        year = year(date),
+        month = month(date),
+        dow = wday(date, label = TRUE))
+  
+    varknots <- quantile(city_df$t2m, varper / 100, na.rm = TRUE)
+    boundknt <- range(city_df$t2m, na.rm = TRUE)
+    
+    argvar <- list(fun = varfun, knots = varknots, Bound = boundknt)
+    cb <- crossbasis(city_df$t2m,
+                     lag = maxlag,
+                     argvar = argvar,
+                     arglag = list(fun = lagfun, knots = lagknots))
+    
+    # Extract column names for all_sex, females, and males
+    yvars_all <- grep(sprintf("^(fem|mal)_[0-9a-z]+_%s$", cx), names(city_df), value = TRUE)
+    yvars_fem <- grep(sprintf("^(fem)_[0-9a-z]+_%s$", cx), names(city_df), value = TRUE)
+    yvars_mal <- grep(sprintf("^(mal)_[0-9a-z]+_%s$", cx), names(city_df), value = TRUE)
+    
+    if (length(yvars_all) == 0) {
+      message("No outcome variables found for city: ", city_name, " | Outtype: ", cx)
+      next
+    }
+      
+    city_df$y_all <- rowSums(city_df[, yvars_all, drop = FALSE], na.rm = TRUE)
+    city_df$y_fem <- rowSums(city_df[, yvars_fem, drop = FALSE], na.rm = TRUE)
+    city_df$y_mal <- rowSums(city_df[, yvars_mal, drop = FALSE], na.rm = TRUE)
+      
+    nred <- attr(cb, "df")[1]
+    nvcov <- sum(1:nred)
+    
+    cnames_coef <- paste0("b", seq(nred))
+    cnames_vcov <- sprintf("v%i%i", 
+      row(matrix(0, nred, nred))[row(matrix(0, nred, nred)) >= col(matrix(0, nred, nred))],
+      col(matrix(0, nred, nred))[row(matrix(0, nred, nred)) >= col(matrix(0, nred, nred))])
+    
+    cat("Exposure: t2m | Outtype:", cx, "| City:", city_name, 
+        "| Total cases:", sum(city_df$y_all, na.rm = TRUE), 
+        "| Female cases:", sum(city_df$y_fem, na.rm = TRUE),
+        "| Male cases:", sum(city_df$y_mal, na.rm = TRUE), "\n")
+        
+    n_years <- length(unique(city_df$year))
+    
+    yvars_list <- c(all_sex = "y_all", fem = "y_fem", mal = "y_mal")
+    
+    for(sx in names(yvars_list)) {
+      
+      yv <- yvars_list[[sx]]
+      fmla <- as.formula(paste0(yv, " ~ cb + dow + ns(date, df = 7 * n_years)"))
+
+      res <- tryCatch(
+        withCallingHandlers(
+          glm(fmla, city_df, family = quasipoisson),
+          warning = function(w) {
+            cat("GLM warning in ", city_name, ":", conditionMessage(w), "\n")
+            invokeRestart("muffleWarning")
+          }
+        ),
+        error   = function(e) { 
+          message("GLM error in ", city_name, ": ", e$message) 
+          NULL 
+          }
+        )
+      
+      if (is.null(res) || !res$converged) {
+        cat("Not converged:", city_name, "| Cause:", cx, "| Sex:", sx, "\n")
+        na_coef <- setNames(rep(NA, nred), cnames_coef)
+        na_vcov <- setNames(rep(NA, nvcov), cnames_vcov)
+        stage1_all[[cx]][[sx]][[city_name]] <- data.frame(
+          location = city_name,
+          exposure = "t2m",
+          t(na_coef), 
+          t(na_vcov),
+          tothosp = sum(city_df[[yv]], na.rm = T), 
+          conv = FALSE,
+          sex = sx,
+          cause = cx
+          )
+          next
+        }
+        
+      redall <- crossreduce(cb, res, cen = median(city_df$t2m, na.rm = TRUE))
+      trimat <- row(vcov(redall)) >= col(vcov(redall))
+      vvec <- vcov(redall)[trimat]
+      names(vvec) <- sprintf("v%i%i", 
+                             row(vcov(redall))[trimat], 
+                             col(vcov(redall))[trimat])
+      
+      stage1_all[[cx]][[sx]][[city_name]] <- data.frame(
+        location = city_name,
+        exposure = "t2m",
+        t(coef(redall)), 
+        t(vvec),
+        tothosp = sum(city_df[[yv]], na.rm = T), 
+        conv = res$converged,
+        sex = sx,
+        cause = cx
+      )
+    }
+  }
+}
+
+allsex_df <- do.call(rbind, lapply(causes, function(cx) do.call(rbind, stage1_all[[cx]][["all_sex"]])))
+fem_df <- do.call(rbind, lapply(causes, function(cx) do.call(rbind, stage1_all[[cx]][["fem"]])))
+mal_df <- do.call(rbind, lapply(causes, function(cx) do.call(rbind, stage1_all[[cx]][["mal"]])))
+
+# Save results
+dir_output <- "/path/to/your/output/directory"
+
+write.csv(allsex_df, 
+          file = paste0(dir, "MX_project1_stage1_allsex_t2m.csv"), 
+          row.names = F)
+
+write.csv(fem_df, 
+          file = paste0(dir, "MX_project1_stage1_fem_t2m.csv"), 
+          row.names = F)
+
+write.csv(mal_df, 
+          file = paste0(dir, "MX_project1_stage1_mal_sex_t2m.csv"), 
+          row.names = F)
+```
+
+## Age-specific analysis
+#### 1st stage: location-age-cause estimates
+```{r}
+stage1_age <- list()
+ 
+for (outtype in causes) {
+  
+  stage1_age[[outtype]] <- list()
+  
+  for (i in seq_along(names(dlist))) {
+    
+    city_name <- names(dlist)[i]
+    
+    city_df <- dlist[[city_name]] %>%
+      mutate(
+        date = as.Date(date),
+        year = year(date),
+        month = month(date),
+        dow = wday(date, label = TRUE)
+        )
+    
+    varknots <- quantile(city_df$t2m, varper / 100, na.rm=TRUE)
+    boundknt <- range(city_df$t2m, na.rm=TRUE)
+      
+    argvar <- list(fun = varfun, knots = varknots, Bound = boundknt)
+    cb <- crossbasis(city_df$t2m,
+                     lag = maxlag,
+                     argvar = argvar,
+                     arglag = list(fun = lagfun, knots = lagknots))
+      
+    yvars <- grep(sprintf("^(fem|mal)_[0-9a-z]+_%s$", outtype), 
+                  names(city_df), value = TRUE)
+    
+    if (length(yvars) == 0) {
+      message("No outcome variables found for city: ", 
+              city_name, " | outtype: ", outtype)
+      next
+      }
+    
+    # combine fem + mal within each age group
+    sxage   <- gsub("^(fem|mal)_([0-9a-z]+)_.*", "\\2", yvars)  # age per column
+    age_levels <- unique(sxage)
+    age_levels <- age_levels[order(as.numeric(substr(age_levels, 1, 2)))]  # ascending by amin
+
+    combvars <- character(0)
+    for (ag in age_levels) {
+      cols_ag <- yvars[sxage == ag]                       # fem + mal for this age
+      newcol  <- sprintf("allsex_%s_%s", ag, outtype)         # e.g. all_0014_all
+      city_df[[newcol]] <- rowSums(city_df[, cols_ag, drop = FALSE], na.rm = TRUE)
+      combvars <- c(combvars, newcol)
+    }
+    
+    # Extract age groups from the column name
+    ageparts <- gsub("^allsex_([0-9a-z]+)_.*", "\\1", combvars)
+    is_openended <- grepl("[a-z]", substr(ageparts, 3, 4))
+    amin <- substr(ageparts, 1, 2)
+    amax <- ifelse(is_openended, "99", substr(ageparts, 3, 4))
+      
+    ytot <- apply(city_df[, combvars, drop = FALSE], 2, sum, na.rm = TRUE)
+    cumgroups <- cumsumbinning(ytot, minhosp, cutwhenpassed = TRUE)
+      
+    # Check the number of cases in the last group
+    last_group <- max(cumgroups)
+    last_total <- sum(ytot[cumgroups == last_group])
+ 
+    # If the number of cases in the last age group is < minhosp, merge it with the preceding age group
+    if (last_total < minhosp && last_group > 1) {
+      cumgroups[cumgroups == last_group] <- last_group - 1
+      cat("Merged last age group in", city_name, 
+          "| cases:", last_total, "-> combined with group", last_group - 1, "\n")
+      }
+      
+    nred <- attr(cb, "df")[1]
+    nvcov <- sum(1:nred)
+      
+    cnames_coef <- paste0("b", seq(nred))
+    cnames_vcov <- sprintf("v%i%i", 
+      row(matrix(0, nred, nred))[row(matrix(0, nred, nred)) >= col(matrix(0, nred, nred))],
+      col(matrix(0, nred, nred))[row(matrix(0, nred, nred)) >= col(matrix(0, nred, nred))])
+      
+    ageres <- list()
+    
+    for (a in unique(cumgroups)) {
+      avars <- combvars[cumgroups == a]
+      city_df$y <- rowSums(city_df[, avars, drop = F])
+      aamin <- amin[cumgroups == a][1]
+      aamax <- tail(amax[cumgroups == a], 1)
+      meanage <- (as.numeric(aamin) + as.numeric(aamax)) / 2
+        
+      cat("Exposure: t2m | Outtype:", outtype, "| City:", city_name, 
+          "| Age:", aamin, "-", aamax, "\n")
+        
+      n_years <- length(unique(city_df$year))
+
+      res <- tryCatch(
+        withCallingHandlers(
+        glm(y ~ cb + dow + ns(date, df = 7 * n_years),
+            city_df, family = quasipoisson),
+        warning = function(w) {
+          cat("GLM warning in ", city_name, ":", conditionMessage(w), "\n")
+          invokeRestart("muffleWarning")
+          }
+        ),
+        error   = function(e) { 
+          message("GLM error in ", city_name, ": ", e$message)
+          NULL 
+          }
+        )
+        
+      if (is.null(res) || !res$converged) {
+        cat("Not converged:", city_name, "| Age:", aamin, "-", aamax, 
+            "| Cause:", outtype, "\n")
+        na_coef <- setNames(rep(NA, nred), cnames_coef)
+        na_vcov <- setNames(rep(NA, nvcov), cnames_vcov)
+        ageres[[a]] <- data.frame(
+          t(na_coef), 
+          t(na_vcov),
+          tothosp = sum(city_df$y, na.rm = T), 
+          conv = F,
+          ageval = meanage, 
+          agegr = paste0(aamin, aamax), 
+          cause = outtype, 
+          n_agegroups = length(unique(cumgroups))
+          )
+        next
+      }
+        
+      redall <- crossreduce(cb, res, cen = median(city_df$t2m, na.rm = TRUE))
+      trimat <- row(vcov(redall)) >= col(vcov(redall))
+      vvec <- vcov(redall)[trimat]
+      names(vvec) <- sprintf("v%i%i", row(vcov(redall))[trimat],
+                             col(vcov(redall))[trimat])
+        
+      ageres[[a]] <- data.frame(
+        t(coef(redall)), 
+        t(vvec),
+        tothosp = sum(city_df$y, na.rm = T), 
+        conv = res$converged,
+        ageval = meanage, 
+        agegr = paste0(aamin, aamax), 
+        cause = outtype,
+        n_agegroups = length(unique(cumgroups))
+        )
+    }
+      
+    stage1_age[[outtype]][[city_name]] <- cbind(
+      location = city_name, do.call(rbind, ageres))
+   }
+}
+  
+stage1_age_combined <- lapply(stage1_age, function(x) do.call(rbind, x))
+stage1_age_combined_all <- do.call(rbind, stage1_age_combined)
+rownames(stage1_age_combined_all) <- NULL
+
+# Save results
+dir_output <- "/path/to/your/output/directory/"
+write.csv(stage1_age_combined_all, 
+          file = paste0(dir, "MX_project1_stage1_age_t2m.csv"), 
+          row.names = F)
+```
